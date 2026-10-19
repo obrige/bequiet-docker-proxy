@@ -1,7 +1,8 @@
 # docker-compose.yml — bequiet-docker-proxy
 #
-# Values come from `.env` (copy .env.example to .env and edit it).
+# All values come from `.env` (copy .env.example to .env and edit it).
 # docker compose reads `.env` automatically from this directory.
+# Every ${VAR:-default} below can be overridden in .env.
 #
 services:
   bequiet-proxy:
@@ -14,22 +15,42 @@ services:
       - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8080}:8080"   # HTTP proxy
       - "${BIND_ADDR:-127.0.0.1}:${SOCKS_PORT:-1080}:1080"  # SOCKS5 proxy
     environment:
-      # --- Tunnel (the "CF URL") -------------------------------------------
-      TUNNEL_BASE: "${TUNNEL_BASE:-https://bequiet.pages.dev/fonts/}"
-      TUNNEL_TIMEOUT: "${TUNNEL_TIMEOUT:-60}"
-      # --- Listeners (container-internal) ----------------------------------
+      # --- Tunnel endpoint (the "CF URL" + prefix) -------------------------
+      TUNNEL_HOST: "${TUNNEL_HOST:-https://bequiet.pages.dev}"
+      PREFIX: "${PREFIX:-/fonts/}"
+      PREFIXES: "${PREFIXES:-}"
+      PREFIX_STRATEGY: "${PREFIX_STRATEGY:-first}"
+      TUNNEL_BASE: "${TUNNEL_BASE:-}"
+
+      # --- Behaviour -------------------------------------------------------
+      DIRECT_FALLBACK: "${DIRECT_FALLBACK:-false}"
+      ALLOW_HOSTS: "${ALLOW_HOSTS:-}"
+      DENY_HOSTS: "${DENY_HOSTS:-}"
+
+      # --- Outbound request tweaks ----------------------------------------
+      EXTRA_HEADERS: "${EXTRA_HEADERS:-}"
+      USER_AGENT: "${USER_AGENT:-}"
+      STRIP_UA: "${STRIP_UA:-false}"
+      VERIFY_SSL: "${VERIFY_SSL:-true}"
+
+      # --- Listeners (container-internal) ---------------------------------
+      HTTP_HOST: "${HTTP_HOST:-0.0.0.0}"
       HTTP_PORT: "8080"
+      SOCKS_HOST: "${SOCKS_HOST:-0.0.0.0}"
       SOCKS_PORT: "1080"
-      # --- HTTPS interception (MITM) ---------------------------------------
-      # true  -> terminate TLS with the local CA and tunnel HTTPS too
-      # false -> HTTPS passes through untunnelled (direct)
-      MITM_ENABLED: "${MITM_ENABLED:-false}"
-      CERTS_DIR: "/certs"
-      # Generate the CA into ./certs on first start (no host openssl needed).
-      GEN_CA_ON_START: "${GEN_CA_ON_START:-false}"
-      # --- Optional SOCKS5 auth --------------------------------------------
+      TUNNEL_TIMEOUT: "${TUNNEL_TIMEOUT:-60}"
+
+      # --- Optional SOCKS5 auth -------------------------------------------
       SOCKS_USER: "${SOCKS_USER:-}"
       SOCKS_PASS: "${SOCKS_PASS:-}"
+
+      # --- HTTPS interception (MITM) --------------------------------------
+      MITM_ENABLED: "${MITM_ENABLED:-false}"
+      CERTS_DIR: "/certs"
+      GEN_CA_ON_START: "${GEN_CA_ON_START:-false}"
+
+      # --- Logging ---------------------------------------------------------
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
     volumes:
       # The CA + generated leaf certs persist here, in ./certs on the host.
       - "${CERTS_DIR:-./certs}:/certs"

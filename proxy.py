@@ -22,37 +22,61 @@ This server fixes that by acting as a *real* forward proxy. Because the browser
 rewrite each request's destination into the CF Pages tunnel URL before it leaves
 the machine. Nothing on the page has to cooperate.
 
+HTTPS handling (two modes)
+--------------------------
+  * MITM_ENABLED=false (default)
+      HTTPS via CONNECT is passed through *untunnelled* (a direct socket splice
+      to the origin). Sites work, but they are NOT routed through CF Pages.
+
+  * MITM_ENABLED=true
+      The proxy terminates TLS using a per-host leaf certificate signed on the
+      fly by the local CA in CERTS_DIR (see scripts/gen-ca.sh). It then reads
+      the plaintext HTTP request, rewrites it into the tunnel URL, fetches it,
+      and re-encrypts the response back to the client. This tunnels HTTPS too.
+      You MUST trust certs/ca.crt for this to work without warnings.
+
 Supported client protocols
 --------------------------
-  * HTTP proxy   : absolute-form GET/POST/... and CONNECT (HTTPS tunneling)
+  * HTTP proxy   : absolute-form GET/POST/... and CONNECT (HTTPS)
   * SOCKS5       : CONNECT command, no auth or user/pass auth
 
-All outbound traffic is funnelled through the CF Pages tunnel, so the origin
-server only ever sees Cloudflare IPs. Note: the tunnel blocks websites that are
-themselves hosted on Cloudflare; those will fail with an error page.
+Note: the tunnel blocks websites that are themselves hosted on Cloudflare;
+those will fail with an error page. Add them to your proxy bypass list.
 
 Usage
 -----
     python3 proxy.py                       # HTTP :8080, SOCKS5 :1080
-    HTTP_PORT=3128 SOCKS_PORT=1081 \
-        TUNNEL_BASE=https://bequiet.pages.dev/fonts/ python3 proxy.py
-
-Then point your browser proxy at 127.0.0.1:8080 (HTTP) or 127.0.0.1:1080 (SOCKS5).
+    MITM_ENABLED=true CERTS_DIR=./certs python3 proxy.py
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import logging
 import os
+import ssl
 import struct
 import sys
+import tempfile
+import threading
 import urllib.parse
-from typing import Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
+
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    HAVE_CRYPTO = True
+except Exception:  # noqa: BLE001
+    HAVE_CRYPTO = False
 
 LOG = logging.getLogger("bequiet-proxy")
 
@@ -60,12 +84,17 @@ LOG = logging.getLogger("bequiet-proxy")
 # Configuration
 # --------------------------------------------------------------------------- #
 
-DEFAULT_TUNNEL_BASE = os.environ.get(
-    "TUNNEL_BASE", "https://bequiet.pages.dev/fonts/"
-)
+DEFAULT_TUNNEL_BASE = os.environ.get("TUNNEL_BASE", "https://bequiet.pages.dev/fonts/")
 DEFAULT_HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 DEFAULT_SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "1080"))
 DEFAULT_TIMEOUT = float(os.environ.get("TUNNEL_TIMEOUT", "60"))
+DEFAULT_CERTS_DIR = os.environ.get("CERTS_DIR", "./certs")
+MITM_ENABLED = os.environ.get("MITM_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Hop-by-hop headers that must not be forwarded to the origin.
 HOP_BY_HOP = {
@@ -89,8 +118,7 @@ def build_tunnel_url(tunnel_base: str, target_url: str) -> str:
     """Turn a target URL into a CF Pages tunnel URL.
 
     We deliberately do NOT url-encode the embedded URL: the Worker expects the
-    raw scheme/host/path after the prefix (it reads request.url and strips the
-    known prefix). Query strings are preserved verbatim.
+    raw scheme/host/path after the prefix. Query strings are preserved verbatim.
     """
     base = tunnel_base
     if not base.endswith("/"):
@@ -110,16 +138,124 @@ def normalize_target(scheme: str, host: str, port: int, path: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# HTTP proxy (absolute-form + CONNECT)
+# Certificate authority (on-the-fly leaf cert minting)
+# --------------------------------------------------------------------------- #
+
+
+class CertAuthority:
+    """Loads a root CA and mints/caches per-host leaf certificates.
+
+    Uses the `cryptography` package if available. Leaf certs are kept in a small
+    in-memory cache keyed by hostname.
+    """
+
+    def __init__(self, certs_dir: str):
+        self.certs_dir = certs_dir
+        self._ca_key = None
+        self._ca_cert = None
+        self._cache: Dict[str, Tuple[ssl.SSLContext, float]] = {}
+        self._lock = threading.Lock()
+
+    def load(self) -> None:
+        if not HAVE_CRYPTO:
+            raise RuntimeError(
+                "MITM requires the 'cryptography' package. "
+                "Install it or disable MITM_ENABLED."
+            )
+        key_path = os.path.join(self.certs_dir, "ca.key")
+        crt_path = os.path.join(self.certs_dir, "ca.crt")
+        if not (os.path.exists(key_path) and os.path.exists(crt_path)):
+            raise RuntimeError(
+                f"CA not found in {self.certs_dir!r}. "
+                "Run scripts/gen-ca.sh first (and mount the folder as a volume)."
+            )
+        with open(key_path, "rb") as fh:
+            self._ca_key = serialization.load_pem_private_key(fh.read(), password=None)
+        with open(crt_path, "rb") as fh:
+            self._ca_cert = x509.load_pem_x509_certificate(fh.read())
+        LOG.info("Loaded CA from %s (subject=%s)", self.certs_dir, self._ca_cert.subject.rfc4514_string())
+
+    def context_for(self, host: str) -> ssl.SSLContext:
+        """Return an SSLContext presenting a leaf cert valid for `host`."""
+        now = datetime.now(timezone.utc).timestamp()
+        with self._lock:
+            cached = self._cache.get(host)
+            if cached and cached[1] > now:
+                return cached[0]
+
+            ctx = self._mint(host)
+            # Cache for ~1 hour.
+            self._cache[host] = (ctx, now + 3600)
+            return ctx
+
+    def _mint(self, host: str) -> ssl.SSLContext:
+        assert self._ca_key is not None and self._ca_cert is not None
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, host)])
+
+        san_entries = []
+        try:
+            san_entries.append(x509.IPAddress(ipaddress.ip_address(host)))
+        except ValueError:
+            san_entries.append(x509.DNSName(host))
+
+        not_before = datetime.now(timezone.utc) - timedelta(minutes=5)
+        not_after = datetime.now(timezone.utc) + timedelta(days=397)
+
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(self._ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+            .add_extension(
+                x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]),
+                critical=False,
+            )
+            .sign(self._ca_key, hashes.SHA256())
+        )
+
+        # Write to a temp dir and load into an SSLContext.
+        tmpdir = tempfile.mkdtemp(prefix="bq-mitm-")
+        cert_path = os.path.join(tmpdir, "cert.pem")
+        key_path = os.path.join(tmpdir, "key.pem")
+        with open(cert_path, "wb") as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(key_path, "wb") as fh:
+            fh.write(
+                key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_path, key_path)
+        return ctx
+
+
+# --------------------------------------------------------------------------- #
+# HTTP proxy (absolute-form + CONNECT, with optional MITM)
 # --------------------------------------------------------------------------- #
 
 
 class HttpProxy:
     """An aiohttp-based HTTP forward proxy that reroutes via the tunnel."""
 
-    def __init__(self, tunnel_base: str, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(
+        self,
+        tunnel_base: str,
+        timeout: float = DEFAULT_TIMEOUT,
+        ca: Optional[CertAuthority] = None,
+    ):
         self.tunnel_base = tunnel_base
         self.timeout = timeout
+        self.ca = ca
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
@@ -134,29 +270,175 @@ class HttpProxy:
         if self._session:
             await self._session.close()
 
-    # -- request handling --------------------------------------------------- #
+    # -- entrypoint --------------------------------------------------------- #
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
+        if request.method == "CONNECT":
+            return await self._handle_connect(request)
+        return await self._forward(request)
+
+    # -- plain HTTP --------------------------------------------------------- #
+
+    async def _forward(self, request: web.Request) -> web.StreamResponse:
         target_url = self._resolve_target(request)
         if target_url is None:
             return web.Response(status=400, text="Bad proxy request")
+        return await self._fetch_and_relay(
+            request.method, target_url, request.headers, await request.read(), request
+        )
 
+    def _resolve_target(self, request: web.Request) -> Optional[str]:
+        raw = request.raw_path
+        parsed = urllib.parse.urlsplit(raw)
+        if parsed.scheme and parsed.netloc:
+            return raw
+        host = request.headers.get("Host")
+        if host:
+            return f"http://{host}{raw}"
+        return None
+
+    # -- CONNECT (HTTPS) ---------------------------------------------------- #
+
+    async def _handle_connect(self, request: web.Request) -> web.StreamResponse:
+        host, _, port_s = request.path.partition(":")
+        port = int(port_s) if port_s else 443
+
+        if self.ca is not None:
+            return await self._handle_connect_mitm(request, host, port)
+        return await self._handle_connect_splice(request, host, port)
+
+    async def _handle_connect_splice(
+        self, request: web.Request, host: str, port: int
+    ) -> web.StreamResponse:
+        """Direct TCP splice — HTTPS works but is NOT tunnelled."""
+        LOG.info("CONNECT %s:%s (direct splice, not tunnelled)", host, port)
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=self.timeout
+            )
+        except OSError as exc:
+            return web.Response(status=502, text=f"CONNECT failed: {exc}")
+
+        resp = web.StreamResponse(status=200, reason="Connection Established")
+        await resp.prepare(request)
+        client_reader = request.transport
+
+        async def pipe(reader, writer):
+            try:
+                while True:
+                    data = await reader.read(65536)
+                    if not data:
+                        break
+                    writer.write(data)
+                    await writer.drain()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Splice both directions.
+        t1 = asyncio.create_task(self._splice_client(request, upstream_writer))
+        t2 = asyncio.create_task(pipe(upstream_reader, request.transport))
+        await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for t in (t1, t2):
+            t.cancel()
+        try:
+            upstream_writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return resp
+
+    async def _splice_client(self, request, upstream_writer):
+        try:
+            while True:
+                data = await request.transport.read(65536)
+                if not data:
+                    break
+                upstream_writer.write(data)
+                await upstream_writer.drain()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _handle_connect_mitm(
+        self, request: web.Request, host: str, port: int
+    ) -> web.StreamResponse:
+        """Terminate TLS, read the HTTP request, tunnel it, re-encrypt back."""
+        LOG.info("CONNECT %s:%s (MITM, tunnelled)", host, port)
+        resp = web.StreamResponse(status=200, reason="Connection Established")
+        await resp.prepare(request)
+
+        transport = request.transport
+        try:
+            server_ctx = self.ca.context_for(host)
+            tls_transport = await transport.start_tls(
+                server_ctx, server_hostname=None
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("MITM TLS handshake failed for %s: %s", host, exc)
+            return resp
+
+        # Read requests off the TLS transport in a loop (keep-alive aware).
+        await self._mitm_loop(tls_transport, host, port)
+        return resp
+
+    async def _mitm_loop(self, tls_transport, host: str, port: int) -> None:
+        scheme = "https"
+        while True:
+            try:
+                head = await asyncio.wait_for(self._read_until(tls_transport, b"\r\n\r\n"), self.timeout)
+            except Exception:  # noqa: BLE001
+                return
+            if not head:
+                return
+            request_line, _, header_block = head.partition(b"\r\n")
+            parts = request_line.split(b" ")
+            if len(parts) < 3:
+                return
+            method = parts[0].decode()
+            path = parts[1].decode()
+
+            headers = self._parse_headers(header_block)
+            # Read body if Content-Length is present.
+            body = b""
+            clen = headers.get("Content-Length")
+            if clen:
+                try:
+                    body = await self._read_exactly(tls_transport, int(clen))
+                except Exception:  # noqa: BLE001
+                    return
+
+            if path.startswith("http://") or path.startswith("https://"):
+                target_url = path
+            else:
+                target_url = normalize_target(scheme, host, port, path)
+
+            upstream = await self._fetch(method, target_url, headers, body)
+            if upstream is None:
+                await self._write_simple(tls_transport, 502, b"Tunnel error")
+                return
+
+            status, reason, resp_headers, resp_body = upstream
+            await self._write_response(tls_transport, status, reason, resp_headers, resp_body)
+
+            if headers.get("Connection", "").lower() == "close":
+                return
+
+    # -- shared fetch ------------------------------------------------------- #
+
+    async def _fetch_and_relay(
+        self, method, target_url, headers, body, request
+    ) -> web.StreamResponse:
         tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
-        LOG.info("%s %s -> %s", request.method, target_url, tunnel_url)
+        LOG.info("%s %s -> %s", method, target_url, tunnel_url)
 
         fwd_headers = {
             k: v
-            for k, v in request.headers.items()
+            for k, v in headers.items()
             if k.lower() not in HOP_BY_HOP and k.lower() != "host"
         }
-        # Present the tunnel host to Cloudflare, not the origin.
         fwd_headers["Host"] = urllib.parse.urlsplit(self.tunnel_base).netloc
-
-        body = await request.read()
 
         try:
             async with self._session.request(
-                request.method,
+                method,
                 tunnel_url,
                 headers=fwd_headers,
                 data=body if body else None,
@@ -167,55 +449,101 @@ class HttpProxy:
             LOG.warning("upstream error for %s: %s", target_url, exc)
             return web.Response(status=502, text=f"Tunnel error: {exc}")
 
-    def _resolve_target(self, request: web.Request) -> Optional[str]:
-        """Extract the absolute target URL from the incoming request."""
-        if request.method == "CONNECT":
-            # host:port in the request line
-            host, _, port_s = request.path.partition(":")
-            port = int(port_s) if port_s else 443
-            return normalize_target("https", host, port, "/")
-
-        # Normal proxy requests use absolute-form request URIs, which aiohttp
-        # exposes as request.url when the path looks absolute.
-        raw = request.raw_path  # e.g. "http://example.com/foo?bar=1"
-        parsed = urllib.parse.urlsplit(raw)
-        if parsed.scheme and parsed.netloc:
-            return raw
-
-        # Some clients send origin-form with a Host header.
-        host = request.headers.get("Host")
-        if host:
-            return f"http://{host}{raw}"
-        return None
-
-    async def _relay(
-        self, request: web.Request, upstream: aiohttp.ClientResponse
-    ) -> web.StreamResponse:
-        resp_headers = {
+    async def _fetch(self, method, target_url, headers, body):
+        """Non-streaming fetch used by the MITM loop."""
+        tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
+        LOG.info("MITM %s %s -> %s", method, target_url, tunnel_url)
+        fwd_headers = {
             k: v
-            for k, v in upstream.headers.items()
-            if k.lower() not in HOP_BY_HOP
+            for k, v in headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
         }
-        # Allow the page to be read from any origin through us.
+        fwd_headers["Host"] = urllib.parse.urlsplit(self.tunnel_base).netloc
+        try:
+            async with self._session.request(
+                method,
+                tunnel_url,
+                headers=fwd_headers,
+                data=body if body else None,
+                allow_redirects=False,
+            ) as upstream:
+                resp_body = await upstream.read()
+                resp_headers = [
+                    (k, v)
+                    for k, v in upstream.headers.items()
+                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+                ]
+                return upstream.status, upstream.reason, resp_headers, resp_body
+        except aiohttp.ClientError as exc:
+            LOG.warning("MITM upstream error for %s: %s", target_url, exc)
+            return None
+
+    async def _relay(self, request, upstream) -> web.StreamResponse:
+        resp_headers = {
+            k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
+        }
         resp_headers.pop("Content-Length", None)
         resp_headers.pop("Content-Encoding", None)
 
-        response = web.StreamResponse(
-            status=upstream.status,
-            headers=resp_headers,
-        )
-        if request.method == "HEAD":
-            response.enable_chunked_encoding()
-            await response.prepare(request)
-            await response.write_eof()
-            return response
-
+        response = web.StreamResponse(status=upstream.status, headers=resp_headers)
         response.enable_chunked_encoding()
         await response.prepare(request)
-        async for chunk in upstream.content.iter_chunked(65536):
-            await response.write(chunk)
+        if request.method != "HEAD":
+            async for chunk in upstream.content.iter_chunked(65536):
+                await response.write(chunk)
         await response.write_eof()
         return response
+
+    # -- low-level helpers -------------------------------------------------- #
+
+    @staticmethod
+    def _parse_headers(block: bytes) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        for line in block.split(b"\r\n"):
+            if b":" in line:
+                k, _, v = line.partition(b":")
+                headers[k.decode().strip()] = v.decode().strip()
+        return headers
+
+    @staticmethod
+    async def _read_until(transport, delimiter: bytes) -> bytes:
+        buf = b""
+        while delimiter not in buf:
+            chunk = await transport.read(4096)
+            if not chunk:
+                return buf
+            buf += chunk
+        return buf
+
+    @staticmethod
+    async def _read_exactly(transport, n: int) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            chunk = await transport.read(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    @staticmethod
+    async def _write_simple(transport, status: int, body: bytes) -> None:
+        head = (
+            f"HTTP/1.1 {status} X\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode()
+        transport.write(head + body)
+
+    @staticmethod
+    async def _write_response(transport, status, reason, headers, body) -> None:
+        lines = [f"HTTP/1.1 {status} {reason}".encode()]
+        for k, v in headers:
+            lines.append(f"{k}: {v}".encode())
+        lines.append(f"Content-Length: {len(body)}".encode())
+        lines.append(b"Connection: keep-alive")
+        lines.append(b"")
+        lines.append(b"")
+        transport.write(b"\r\n".join(lines) + body)
 
 
 # --------------------------------------------------------------------------- #
@@ -241,11 +569,13 @@ class Socks5Proxy:
         timeout: float = DEFAULT_TIMEOUT,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        ca: Optional[CertAuthority] = None,
     ):
         self.tunnel_base = tunnel_base
         self.timeout = timeout
         self.username = username
         self.password = password
+        self.ca = ca
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
@@ -260,9 +590,7 @@ class Socks5Proxy:
         if self._session:
             await self._session.close()
 
-    async def handle(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             await self._negotiate(reader, writer)
             target = await self._read_request(reader, writer)
@@ -281,9 +609,7 @@ class Socks5Proxy:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _negotiate(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _negotiate(self, reader, writer) -> None:
         header = await reader.readexactly(2)
         version, nmethods = header[0], header[1]
         if version != SOCKS_VERSION:
@@ -306,9 +632,7 @@ class Socks5Proxy:
             writer.write(bytes([SOCKS_VERSION, SOCKS_AUTH_NONE]))
             await writer.drain()
 
-    async def _auth_userpass(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
+    async def _auth_userpass(self, reader, writer) -> None:
         version = (await reader.readexactly(1))[0]
         if version != 0x01:
             raise ValueError("bad auth version")
@@ -322,13 +646,11 @@ class Socks5Proxy:
         if not ok:
             raise ValueError("bad credentials")
 
-    async def _read_request(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> Optional[Tuple[str, str, int]]:
+    async def _read_request(self, reader, writer) -> Optional[Tuple[str, str, int]]:
         header = await reader.readexactly(4)
         version, cmd, _, atyp = header
         if version != SOCKS_VERSION or cmd != SOCKS_CMD_CONNECT:
-            await self._reply(writer, 0x07)  # command not supported
+            await self._reply(writer, 0x07)
             return None
 
         if atyp == SOCKS_ATYP_IPV4:
@@ -341,73 +663,51 @@ class Socks5Proxy:
             raw = await reader.readexactly(16)
             host = ":".join(f"{raw[i]:02x}{raw[i + 1]:02x}" for i in range(0, 16, 2))
         else:
-            await self._reply(writer, 0x08)  # address type not supported
+            await self._reply(writer, 0x08)
             return None
 
         port = struct.unpack("!H", await reader.readexactly(2))[0]
         return ("https", host, port)
 
-    async def _reply(self, writer: asyncio.StreamWriter, code: int) -> None:
-        # VER, REP, RSV, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0
+    async def _reply(self, writer, code: int) -> None:
         writer.write(bytes([SOCKS_VERSION, code, 0x00, SOCKS_ATYP_IPV4, 0, 0, 0, 0, 0, 0]))
         await writer.drain()
 
-    async def _tunnel(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        scheme: str,
-        host: str,
-        port: int,
-    ) -> None:
-        # We do not know the path yet; SOCKS gives us only host:port. We proxy
-        # the connection to the tunnel root for that host. For plain HTTP the
-        # client will send origin-form requests on this socket, which we must
-        # read and forward. To keep it robust we relay raw bytes: read the first
-        # HTTP request line, rewrite it to absolute tunnel form, then splice.
+    async def _tunnel(self, reader, writer, scheme, host, port) -> None:
         target_url = normalize_target(scheme, host, port, "/")
         tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
         LOG.info("SOCKS5 CONNECT %s:%s -> %s", host, port, tunnel_url)
 
-        # For HTTPS the client immediately starts a TLS handshake after CONNECT;
-        # we cannot intercept it through the HTTP tunnel (the tunnel is plain
-        # HTTP, not a CONNECT tunnel). So we open a websocket-style byte pipe
-        # against the tunnel URL is not possible. Instead we fall back to the
-        # aiohttp-based request path for HTTP, and refuse raw TLS for HTTPS.
-        #
-        # Practical approach: read the first request; if it is a TLS ClientHello
-        # we cannot proxy it transparently, so reply success and close (client
-        # will retry via the HTTP proxy path). This is a known limitation of
-        # HTTP-reverse-proxy based tunnels.
         await self._reply(writer, 0x00)
         first = await asyncio.wait_for(reader.read(1), timeout=self.timeout)
         if not first:
             return
-        if first == b"\x16":  # TLS handshake record
-            LOG.info("SOCKS5 HTTPS to %s not transparently tunnelable; closing", host)
+
+        if first == b"\x16":
+            # TLS ClientHello. Without MITM we can't transparently tunnel raw
+            # TLS through an HTTP reverse proxy; with MITM we could terminate
+            # it, but SOCKS5 has no SNI-capture step here. Advise HTTP proxy.
+            LOG.info(
+                "SOCKS5 TLS to %s cannot be tunnelled through an HTTP reverse "
+                "proxy; use the HTTP proxy (CONNECT + MITM) instead.",
+                host,
+            )
             return
-        # Plain HTTP: read the rest of the request line + headers.
+
         rest = await reader.readuntil(b"\r\n\r\n")
         request_head = first + rest
         first_line, _, header_block = request_head.partition(b"\r\n")
         method, path, version = first_line.split(b" ", 2)
         if path.startswith(b"http://") or path.startswith(b"https://"):
-            absolute = path
+            absolute = path.decode()
         else:
-            absolute = normalize_target(scheme, host, port, path.decode()).encode()
-        tunnel = build_tunnel_url(self.tunnel_base, absolute.decode()).encode()
-        new_head = method + b" " + tunnel + b" " + version + b"\r\n" + header_block
+            absolute = normalize_target(scheme, host, port, path.decode())
+        tunnel = build_tunnel_url(self.tunnel_base, absolute)
 
         async with self._session.request(
-            method.decode(),
-            tunnel.decode(),
-            headers=self._parse_headers(header_block),
-            data=None,
+            method.decode(), tunnel, headers=self._parse_headers(header_block), data=None
         ) as upstream:
-            await writer.write(
-                b"HTTP/1.1 %d %s\r\n"
-                % (upstream.status, upstream.reason.encode())
-            )
+            writer.write(b"HTTP/1.1 %d %s\r\n" % (upstream.status, upstream.reason.encode()))
             for k, v in upstream.headers.items():
                 if k.lower() not in HOP_BY_HOP:
                     writer.write(f"{k}: {v}\r\n".encode())
@@ -433,12 +733,18 @@ class Socks5Proxy:
 
 
 async def run(args: argparse.Namespace) -> None:
-    http_proxy = HttpProxy(args.tunnel_base, timeout=args.timeout)
+    ca = None
+    if args.mitm:
+        ca = CertAuthority(args.certs_dir)
+        ca.load()
+
+    http_proxy = HttpProxy(args.tunnel_base, timeout=args.timeout, ca=ca)
     socks_proxy = Socks5Proxy(
         args.tunnel_base,
         timeout=args.timeout,
         username=args.socks_user,
         password=args.socks_pass,
+        ca=ca,
     )
     await http_proxy.start()
     await socks_proxy.start()
@@ -457,6 +763,7 @@ async def run(args: argparse.Namespace) -> None:
     LOG.info("HTTP proxy listening on %s:%s", args.http_host, args.http_port)
     LOG.info("SOCKS5 proxy listening on %s:%s", args.socks_host, args.socks_port)
     LOG.info("Tunnel base: %s", args.tunnel_base)
+    LOG.info("MITM: %s", "enabled" if ca else "disabled")
 
     try:
         async with socks_server:
@@ -477,6 +784,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--socks-user", default=os.environ.get("SOCKS_USER"))
     parser.add_argument("--socks-pass", default=os.environ.get("SOCKS_PASS"))
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--certs-dir", default=DEFAULT_CERTS_DIR)
+    parser.add_argument(
+        "--mitm",
+        action="store_true",
+        default=MITM_ENABLED,
+        help="Enable HTTPS interception using the CA in --certs-dir",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 

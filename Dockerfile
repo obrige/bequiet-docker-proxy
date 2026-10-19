@@ -6,13 +6,19 @@ LABEL org.opencontainers.image.title="bequiet-docker-proxy" \
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    TUNNEL_BASE=https://bequiet.pages.dev/fonts/ \
+    TUNNEL_HOST=https://bequiet.pages.dev \
+    PREFIX=/fonts/ \
+    PREFIX_STRATEGY=first \
+    DIRECT_FALLBACK=false \
+    HTTP_HOST=0.0.0.0 \
     HTTP_PORT=8080 \
+    SOCKS_HOST=0.0.0.0 \
     SOCKS_PORT=1080 \
     TUNNEL_TIMEOUT=60 \
     CERTS_DIR=/certs \
     MITM_ENABLED=false \
-    GEN_CA_ON_START=false
+    GEN_CA_ON_START=false \
+    LOG_LEVEL=INFO
 
 WORKDIR /app
 

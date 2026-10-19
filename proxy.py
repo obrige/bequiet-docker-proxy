@@ -29,10 +29,25 @@ Everything is driven by environment variables (see .env.example). Highlights:
   * TUNNEL_HOST / PREFIX        — decouple host from path prefix
   * PREFIXES                    — several prefixes, rotated by PREFIX_STRATEGY
   * DIRECT_FALLBACK             — retry directly when the tunnel errors
-                                  (works around Cloudflare-hosted targets)
   * ALLOW_HOSTS / DENY_HOSTS    — only tunnel / never tunnel matching hosts
   * EXTRA_HEADERS / USER_AGENT  — customise outbound requests
   * MITM_ENABLED / CERTS_DIR    — HTTPS interception with a local CA
+
+Tunnel-error detection
+----------------------
+When DIRECT_FALLBACK is on, we must distinguish a *real* origin 5xx from a
+Cloudflare *Worker error page* returned by the tunnel itself. Measured against
+the live tunnel, the error page is:
+
+    HTTP 500
+    server: cloudflare
+    content-type: text/html; charset=UTF-8
+    body contains: "Worker threw exception" | cf.errors.css | cloudflare.com/5xx-error-landing
+
+A successful tunnelled response is also served with `server: cloudflare` and a
+`cf-ray` header, so those are NOT discriminators. The precise signals are the
+5xx status *combined with* one of the Cloudflare error-page body markers. We
+only peek the first few KB of the body to check, then stream the rest untouched.
 
 HTTPS handling (two modes)
 --------------------------
@@ -101,6 +116,17 @@ HOP_BY_HOP = {
     "upgrade",
     "proxy-connection",
 }
+
+# Markers that identify a Cloudflare *error page* (as opposed to a real origin
+# response). All measured live against the tunnel. See module docstring.
+CF_ERROR_MARKERS: Tuple[bytes, ...] = (
+    b"Worker threw exception",
+    b"cf.errors.css",
+    b"cloudflare.com/5xx-error-landing",
+)
+
+# How many leading bytes of a candidate error response to inspect.
+CF_ERROR_PEEK_BYTES = 8192
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +227,6 @@ class Config:
     # -- derived ------------------------------------------------------------ #
 
     def prefix_for(self, target_url: str) -> str:
-        """Pick a prefix according to the configured strategy."""
         if len(self.prefixes) == 1:
             return self.prefixes[0]
         strategy = self.prefix_strategy.lower()
@@ -225,15 +250,7 @@ class Config:
     def tunnel_netloc(self) -> str:
         return urllib.parse.urlsplit(self.tunnel_host).netloc
 
-    # -- host filtering ----------------------------------------------------- #
-
     def host_allowed(self, host: str) -> bool:
-        """Decide whether `host` should be tunnelled.
-
-        * DENY_HOSTS match  -> not tunnelled (direct/blocked)
-        * ALLOW_HOSTS empty -> everything else is tunnelled
-        * ALLOW_HOSTS set   -> only matching hosts are tunnelled
-        """
         host = (host or "").lower()
         if any(_host_match(pat, host) for pat in self.deny_hosts):
             return False
@@ -245,16 +262,12 @@ class Config:
     def from_env(cls) -> "Config":
         cfg = cls()
 
-        # --- Tunnel endpoint -------------------------------------------------
-        # Prefer TUNNEL_HOST + PREFIX(ES). Fall back to TUNNEL_BASE for
-        # backwards compatibility (split it into host + prefix).
         tunnel_host = os.environ.get("TUNNEL_HOST")
         prefixes = env_list("PREFIXES")
         prefix = os.environ.get("PREFIX")
 
         tunnel_base = os.environ.get("TUNNEL_BASE")
         if tunnel_base and not tunnel_host:
-            # Split ".../fonts/" -> host="https://...", prefix="/fonts/"
             split = urllib.parse.urlsplit(tunnel_base)
             tunnel_host = f"{split.scheme}://{split.netloc}"
             derived_prefix = split.path or "/"
@@ -274,18 +287,15 @@ class Config:
 
         cfg.prefix_strategy = os.environ.get("PREFIX_STRATEGY", "first").strip().lower()
 
-        # --- Behaviour -------------------------------------------------------
         cfg.direct_fallback = env_bool("DIRECT_FALLBACK", False)
         cfg.allow_hosts = env_list("ALLOW_HOSTS")
         cfg.deny_hosts = env_list("DENY_HOSTS")
 
-        # --- Outbound tweaks -------------------------------------------------
         cfg.extra_headers = parse_headers(os.environ.get("EXTRA_HEADERS", ""))
         cfg.user_agent = os.environ.get("USER_AGENT") or None
         cfg.strip_ua = env_bool("STRIP_UA", False)
         cfg.verify_ssl = env_bool("VERIFY_SSL", True)
 
-        # --- Networking ------------------------------------------------------
         cfg.http_host = os.environ.get("HTTP_HOST", "0.0.0.0")
         cfg.http_port = env_int("HTTP_PORT", 8080)
         cfg.socks_host = os.environ.get("SOCKS_HOST", "0.0.0.0")
@@ -294,7 +304,6 @@ class Config:
         cfg.socks_pass = os.environ.get("SOCKS_PASS") or None
         cfg.timeout = env_float("TUNNEL_TIMEOUT", 60.0)
 
-        # --- HTTPS interception ---------------------------------------------
         cfg.mitm = env_bool("MITM_ENABLED", False)
         cfg.certs_dir = os.environ.get("CERTS_DIR", "./certs")
 
@@ -339,6 +348,30 @@ def normalize_target(scheme: str, host: str, port: int, path: str) -> str:
     if not path:
         path = "/"
     return f"{scheme}://{netloc}{path}"
+
+
+# --------------------------------------------------------------------------- #
+# Tunnel-error detection
+# --------------------------------------------------------------------------- #
+
+
+def is_cf_error_page(status: int, content_type: str, peeked: bytes) -> bool:
+    """Return True if this response is a Cloudflare error page.
+
+    Precise signature (measured live against the tunnel):
+
+        * HTTP status is 5xx, AND
+        * content-type is text/html, AND
+        * the body starts with a known Cloudflare error-page marker.
+
+    `server: cloudflare` and `cf-ray` are present on *successful* tunnelled
+    responses too, so they are deliberately NOT used as discriminators.
+    """
+    if status < 500 or status > 599:
+        return False
+    if "text/html" not in (content_type or "").lower():
+        return False
+    return any(marker in peeked for marker in CF_ERROR_MARKERS)
 
 
 # --------------------------------------------------------------------------- #
@@ -450,13 +483,11 @@ def build_forward_headers(cfg: Config, incoming) -> Dict[str, str]:
         for k, v in incoming.items()
         if k.lower() not in HOP_BY_HOP and k.lower() != "host"
     }
-    # Present the tunnel host to Cloudflare, not the origin.
     headers["Host"] = cfg.tunnel_netloc
     if cfg.strip_ua:
         headers.pop("User-Agent", None)
     elif cfg.user_agent:
         headers["User-Agent"] = cfg.user_agent
-    # Custom headers (may override anything above).
     for k, v in cfg.extra_headers.items():
         headers[k] = v
     return headers
@@ -666,11 +697,23 @@ class HttpProxy:
                 allow_redirects=False,
                 ssl=self.cfg.verify_ssl,
             ) as upstream:
-                if self._is_tunnel_error(upstream) and self.cfg.direct_fallback:
-                    LOG.info("%s %s -> tunnel error, retrying DIRECT", method, target_url)
-                    return await self._relay_direct(
-                        request, method, target_url, fwd_headers, body
-                    )
+                if self.cfg.direct_fallback and self._looks_like_error(upstream):
+                    peeked = await self._peek(upstream)
+                    if is_cf_error_page(
+                        upstream.status,
+                        upstream.headers.get("Content-Type", ""),
+                        peeked,
+                    ):
+                        LOG.info(
+                            "%s %s -> tunnel error page, retrying DIRECT",
+                            method,
+                            target_url,
+                        )
+                        return await self._relay_direct(
+                            request, method, target_url, fwd_headers, body
+                        )
+                    # Legit 5xx: stream the peeked bytes + the rest.
+                    return await self._relay(request, upstream, prefix=peeked)
                 return await self._relay(request, upstream)
         except aiohttp.ClientError as exc:
             LOG.warning("upstream error for %s: %s", target_url, exc)
@@ -696,13 +739,21 @@ class HttpProxy:
             return web.Response(status=502, text=f"Direct error: {exc}")
 
     @staticmethod
-    def _is_tunnel_error(upstream: aiohttp.ClientResponse) -> bool:
-        """Heuristically detect a Cloudflare Worker error response."""
-        if upstream.status >= 500:
-            return True
-        ct = upstream.headers.get("Content-Type", "")
-        server = upstream.headers.get("Server", "").lower()
-        return "text/html" in ct and "cloudflare" in server and upstream.status == 200
+    def _looks_like_error(upstream: aiohttp.ClientResponse) -> bool:
+        """Cheap pre-check before peeking the body."""
+        return upstream.status >= 500
+
+    @staticmethod
+    async def _peek(upstream: aiohttp.ClientResponse) -> bytes:
+        """Read up to CF_ERROR_PEEK_BYTES from the body without consuming it all.
+
+        Returns the peeked bytes; the caller must re-emit them to the client if
+        the response turns out to be legitimate.
+        """
+        try:
+            return await upstream.content.read(CF_ERROR_PEEK_BYTES)
+        except Exception:  # noqa: BLE001
+            return b""
 
     async def _fetch(self, method, target_url, headers, body):
         """Non-streaming fetch used by the MITM loop."""
@@ -725,10 +776,24 @@ class HttpProxy:
                 allow_redirects=False,
                 ssl=self.cfg.verify_ssl,
             ) as upstream:
-                if self._is_tunnel_error(upstream) and self.cfg.direct_fallback:
-                    LOG.info("MITM %s %s -> tunnel error, retrying DIRECT", method, target_url)
+                resp_body = await upstream.read()
+                if self.cfg.direct_fallback and is_cf_error_page(
+                    upstream.status,
+                    upstream.headers.get("Content-Type", ""),
+                    resp_body[:CF_ERROR_PEEK_BYTES],
+                ):
+                    LOG.info(
+                        "MITM %s %s -> tunnel error page, retrying DIRECT",
+                        method,
+                        target_url,
+                    )
                     return await self._fetch_direct(method, target_url, fwd_headers, body)
-                return await self._read_response(upstream)
+                resp_headers = [
+                    (k, v)
+                    for k, v in upstream.headers.items()
+                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+                ]
+                return upstream.status, upstream.reason, resp_headers, resp_body
         except aiohttp.ClientError as exc:
             LOG.warning("MITM upstream error for %s: %s", target_url, exc)
             if self.cfg.direct_fallback:
@@ -747,22 +812,20 @@ class HttpProxy:
                 data=body if body else None,
                 allow_redirects=False,
             ) as upstream:
-                return await self._read_response(upstream)
+                resp_body = await upstream.read()
+                resp_headers = [
+                    (k, v)
+                    for k, v in upstream.headers.items()
+                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+                ]
+                return upstream.status, upstream.reason, resp_headers, resp_body
         except aiohttp.ClientError as exc:
             LOG.warning("direct fetch error for %s: %s", target_url, exc)
             return None
 
-    @staticmethod
-    async def _read_response(upstream):
-        resp_body = await upstream.read()
-        resp_headers = [
-            (k, v)
-            for k, v in upstream.headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
-        ]
-        return upstream.status, upstream.reason, resp_headers, resp_body
-
-    async def _relay(self, request, upstream) -> web.StreamResponse:
+    async def _relay(
+        self, request, upstream, prefix: bytes = b""
+    ) -> web.StreamResponse:
         resp_headers = {
             k: v for k, v in upstream.headers.items() if k.lower() not in HOP_BY_HOP
         }
@@ -773,6 +836,8 @@ class HttpProxy:
         response.enable_chunked_encoding()
         await response.prepare(request)
         if request.method != "HEAD":
+            if prefix:
+                await response.write(prefix)
             async for chunk in upstream.content.iter_chunked(65536):
                 await response.write(chunk)
         await response.write_eof()
@@ -1072,7 +1137,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> Config:
     cfg = Config.from_env()
-    # CLI flags override env where provided.
     if args.tunnel_host:
         cfg.tunnel_host = args.tunnel_host.rstrip("/")
     if args.prefixes:

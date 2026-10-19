@@ -4,6 +4,8 @@ Turn [`bequiet.pages.dev`](https://bequiet.pages.dev) — a Cloudflare Pages **p
 
 Point your browser's proxy at this container and *all* traffic is tunnelled through the Cloudflare Pages edge. No more "some sites load, some don't" — every request (navigations, XHR/fetch, images, CSS, JS) is rewritten and routed through the tunnel.
 
+> **Configurable CF URL, a local CA, and a mounted `./certs` volume** are all built in — swap the tunnel endpoint via `.env`, and optionally enable HTTPS interception (MITM) with certificates generated on your machine.
+
 ---
 
 ## Table of contents
@@ -11,8 +13,10 @@ Point your browser's proxy at this container and *all* traffic is tunnelled thro
 - [Background: why this exists](#background-why-this-exists)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
-- [Configuration](#configuration)
+- [Configuration (`.env`)](#configuration-env)
+- [HTTPS interception & the local CA](#https-interception--the-local-ca)
 - [Client setup (Zero Omega)](#client-setup-zero-omega)
+- [Building / publishing](#building--publishing)
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -29,7 +33,9 @@ https://bequiet.pages.dev/fonts/https://example.com/foo?bar=1
         └──────────── tunnel prefix ────────┘└──── target URL ────┘
 ```
 
-The Worker fetches `https://example.com/foo?bar=1` server-side and streams the response back to you. Because the request leaves Cloudflare's network (not your machine), the origin only ever sees Cloudflare IPs.
+The Worker fetches `https://example.com/foo?bar=1` server-side and streams the response back. Because the request leaves Cloudflare's network (not your machine), the origin only ever sees Cloudflare IPs.
+
+The prefix is **configurable** (`TUNNEL_BASE`), so you can point it at your own deployment.
 
 It has one catch worth knowing up front:
 
@@ -74,20 +80,27 @@ GET https://bequiet.pages.dev/fonts/https://example.com/static/app.js
 
 fetches that, and streams the body back. The browser believes it talked to `example.com`.
 
+### HTTPS handling (two modes)
+
+| Mode | `MITM_ENABLED` | HTTPS behaviour |
+| --- | --- | --- |
+| Pass-through | `false` *(default)* | `CONNECT` is spliced **directly** to the origin. HTTPS works, but is **not** tunnelled. No CA needed. |
+| Interception | `true` | The proxy terminates TLS with a per-host leaf cert signed by your local CA, reads the plaintext request, tunnels it, and re-encrypts the response. **HTTPS is tunnelled.** You must trust the CA. |
+
 ### Implementation notes
 
-- **Pure Python asyncio** — `aiohttp` for the outbound tunnel request, raw `asyncio` streams for the SOCKS5 server.
-- **HTTP proxy**: handles both absolute-form requests (`GET http://host/path`) and `CONNECT`.
-- **SOCKS5**: implements the handshake, optional user/pass auth, and the `CONNECT` command. Plain-HTTP over SOCKS is rewritten to the tunnel; TLS over SOCKS cannot be transparently intercepted by an *HTTP* reverse proxy (see [Limitations](#limitations)) — use the HTTP proxy for HTTPS.
-- **Hop-by-hop headers** (`Connection`, `Transfer-Encoding`, `Upgrade`, ...) are stripped in both directions; the `Host` header is rewritten to the tunnel host.
+- **Pure Python asyncio** — `aiohttp` for the outbound tunnel request, raw `asyncio` streams for the SOCKS5 server and the TLS-terminating MITM loop.
+- **HTTP proxy**: absolute-form requests (`GET http://host/path`) and `CONNECT`.
+- **SOCKS5**: handshake, optional user/pass auth, `CONNECT` command. Plain-HTTP over SOCKS is tunnelled; raw TLS over SOCKS is not (use the HTTP proxy for HTTPS).
+- **Hop-by-hop headers** (`Connection`, `Transfer-Encoding`, `Upgrade`, ...) are stripped in both directions; `Host` is rewritten to the tunnel host.
 
 ## Quick start
-
-### Option A — Docker Compose (recommended)
 
 ```bash
 git clone https://github.com/obrige/bequiet-docker-proxy.git
 cd bequiet-docker-proxy
+
+cp .env.example .env        # (optional) edit TUNNEL_BASE / ports / MITM
 docker compose up -d --build
 ```
 
@@ -96,75 +109,137 @@ You now have:
 - HTTP proxy at `127.0.0.1:8080`
 - SOCKS5 proxy at `127.0.0.1:1080`
 
-### Option B — plain Docker
+Prefer a prebuilt image?
 
 ```bash
-docker build -t bequiet-docker-proxy .
 docker run -d --name bequiet-proxy \
-  -p 8080:8080 -p 1080:1080 \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:1080:1080 \
+  -v "$PWD/certs:/certs" \
   -e TUNNEL_BASE=https://bequiet.pages.dev/fonts/ \
-  --restart unless-stopped \
-  bequiet-docker-proxy
+  ghcr.io/obrige/bequiet-docker-proxy:latest
 ```
 
-### Option C — run without Docker
+## Configuration (`.env`)
+
+All settings live in `.env` (copied from `.env.example`). `docker compose` reads it automatically.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TUNNEL_BASE` | `https://bequiet.pages.dev/fonts/` | **The CF URL / reverse-proxy prefix.** Must end with `/`. Change to self-host. |
+| `BIND_ADDR` | `127.0.0.1` | Host interface to publish on. Use `0.0.0.0` for LAN access. |
+| `HTTP_PORT` | `8080` | Host port for the HTTP proxy. |
+| `SOCKS_PORT` | `1080` | Host port for the SOCKS5 proxy. |
+| `TUNNEL_TIMEOUT` | `60` | Outbound request timeout (seconds). |
+| `MITM_ENABLED` | `false` | Enable HTTPS interception (see below). |
+| `CERTS_DIR` | `./certs` | Host folder holding the CA, bind-mounted to `/certs`. |
+| `GEN_CA_ON_START` | `false` | Generate the CA into `./certs` on first container start. |
+| `SOCKS_USER` / `SOCKS_PASS` | *(unset)* | Enable SOCKS5 user/pass auth. |
+
+Environment variables can also be passed directly to `proxy.py` as CLI flags (`--tunnel-base`, `--mitm`, `--certs-dir`, ...).
+
+## HTTPS interception & the local CA
+
+To tunnel **HTTPS** (not just plain HTTP), the proxy must decrypt TLS, which requires a local **certificate authority** your browser trusts.
+
+### 1. Generate the CA into `./certs`
+
+**Option A — on the host** (needs `openssl`):
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python proxy.py
+./scripts/gen-ca.sh
+# -> ./certs/ca.key  ./certs/ca.crt  ./certs/leaf.key  ./certs/leaf.crt
 ```
 
-## Configuration
+**Option B — inside the container** (no host `openssl` needed):
 
-All options are environment variables (or CLI flags for `proxy.py`):
+```bash
+GEN_CA_ON_START=true docker compose up -d --build
+```
 
-| Env var | CLI flag | Default | Description |
-| --- | --- | --- | --- |
-| `TUNNEL_BASE` | `--tunnel-base` | `https://bequiet.pages.dev/fonts/` | Reverse-proxy prefix. Change if you self-host the Worker. |
-| `HTTP_PORT` | `--http-port` | `8080` | HTTP proxy listen port. |
-| `SOCKS_PORT` | `--socks-port` | `1080` | SOCKS5 proxy listen port. |
-| `TUNNEL_TIMEOUT` | `--timeout` | `60` | Outbound request timeout (seconds). |
-| `SOCKS_USER` | `--socks-user` | *(unset)* | Enable SOCKS5 user/pass auth. |
-| `SOCKS_PASS` | `--socks-pass` | *(unset)* | SOCKS5 password (with `SOCKS_USER`). |
+Either way, the files land in `./certs` on the host, because `docker-compose.yml` bind-mounts it as a volume:
 
-> **Note:** the listener binds `0.0.0.0` inside the container; the host port mapping controls exposure. To restrict to localhost only, map ports as `127.0.0.1:8080:8080` (see the commented block in `docker-compose.yml`).
+```yaml
+volumes:
+  - "${CERTS_DIR:-./certs}:/certs"
+```
+
+`./certs` is git-ignored — **private keys never leave your machine and are never committed.**
+
+### 2. Trust `certs/ca.crt`
+
+| Platform | Command / steps |
+| --- | --- |
+| **Firefox** | `about:preferences#privacy` → View Certificates → Authorities → Import → `certs/ca.crt` |
+| **Chrome** | `chrome://settings/certificates` → Authorities → Import → `certs/ca.crt` |
+| **macOS** | `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain certs/ca.crt` |
+| **Linux** | `sudo cp certs/ca.crt /usr/local/share/ca-certificates/bequiet-ca.crt && sudo update-ca-certificates` |
+| **Windows** | `certutil -addstore -f Root certs\ca.crt` |
+
+### 3. Enable MITM and restart
+
+```bash
+# in .env
+MITM_ENABLED=true
+```
+
+```bash
+docker compose up -d
+```
+
+Now `curl -x http://127.0.0.1:8080 https://example.com -I` is tunnelled end-to-end, and so is everything your browser sends.
+
+> ⚠️ Only install the CA on machines you control. Anyone holding `certs/ca.key` can impersonate any HTTPS site to a client that trusts it.
 
 ## Client setup (Zero Omega)
 
-1. Install **Zero Omega** (or SwitchyOmega) in your browser.
-2. Create a new **Proxy Profile**.
-3. Add a server:
+1. Install **Zero Omega** (or SwitchyOmega).
+2. Create a **Proxy Profile** and add a server:
 
    | Field | Value |
    | --- | --- |
-   | Protocol | `HTTP` (recommended) or `SOCKS5` |
+   | Protocol | `HTTP` (recommended — supports MITM for HTTPS) |
    | Server | `127.0.0.1` |
-   | Port | `8080` (HTTP) / `1080` (SOCKS5) |
+   | Port | `8080` |
 
-4. Apply the profile to the whole browser ("Apply changes everywhere") so **all** traffic is routed through the proxy.
-5. *(Optional)* Use the profile's **Bypass List** to skip domains you don't want tunnelled — notably Cloudflare-hosted sites that the tunnel itself rejects, e.g. `*.cloudflare.com`, `*.pages.dev`, `*.workers.dev`.
+3. Apply the profile to the whole browser so **all** traffic is routed through the proxy.
+4. *(Optional)* Add a **Bypass List** for Cloudflare-hosted sites the tunnel rejects: `*.cloudflare.com`, `*.pages.dev`, `*.workers.dev`.
+
+## Building / publishing
+
+Build locally:
+
+```bash
+docker build -t bequiet-docker-proxy .
+```
+
+A GitHub Actions workflow ([`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)) builds a multi-arch (`amd64`/`arm64`) image and pushes it to **GHCR** on every push to `main` and on version tags:
+
+```
+ghcr.io/obrige/bequiet-docker-proxy:latest
+```
 
 ## Limitations
 
-- **Cloudflare-hosted origins are blocked by the tunnel itself.** That is a property of `bequiet.pages.dev`, not of this proxy. Add them to the bypass list, or self-host a Worker without that restriction.
-- **HTTPS over SOCKS5 is not transparently tunnellable.** SOCKS gives the proxy only `host:port`, then the client starts a TLS handshake. Since the upstream is an *HTTP* reverse proxy (not a `CONNECT` tunnel), raw TLS can't be spliced through. **Use the HTTP proxy profile for HTTPS traffic.**
+- **Cloudflare-hosted origins are blocked by the tunnel itself.** A property of `bequiet.pages.dev`, not of this proxy. Add them to the bypass list, or self-host a Worker without that restriction.
+- **HTTPS over SOCKS5 is not transparently tunnellable.** SOCKS gives only `host:port`, then the client starts TLS. Use the **HTTP proxy** for HTTPS.
+- **MITM is not transparent to certificate pinning.** Sites/apps that pin certs will still fail.
 - **Latency / throughput** are bounded by the Cloudflare Pages edge and the Worker.
 - **Streaming / long-poll / WebSocket** endpoints may not work well through a request-response reverse proxy.
-- **Cookies / `Set-Cookie` domains** are rewritten to the tunnel host by the Worker; complex auth flows may misbehave.
-- This is a research / personal-use tool. Respect the terms of service of any site you access, and local laws.
+- **Cookies / `Set-Cookie` domains** are rewritten to the tunnel host; complex auth flows may misbehave.
+- Research / personal-use tool. Respect site terms of service and local laws.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| Pages "half load" (HTML ok, assets missing) | Browser is not routing **all** traffic through the proxy. Enable "apply to all" in Zero Omega. |
-| `Worker threw exception` / error page | The target site is hosted on Cloudflare — add it to the bypass list. |
-| `Tunnel error: ...` from the proxy | Outbound request failed or timed out. Raise `TUNNEL_TIMEOUT`, or the target is blocked. |
-| HTTPS fails on SOCKS5 | Expected — use the HTTP proxy for HTTPS. |
-| Can't reach the proxy from another machine | The default mapping publishes on all host interfaces; firewall may block it. |
+| Pages "half load" (HTML ok, assets missing) | Browser isn't routing **all** traffic through the proxy. Enable "apply to all" in Zero Omega. |
+| `Worker threw exception` / error page | Target site is hosted on Cloudflare — add it to the bypass list. |
+| `Tunnel error: ...` from the proxy | Outbound request failed/timed out. Raise `TUNNEL_TIMEOUT`, or the target is blocked. |
+| HTTPS fails on SOCKS5 | Expected — use the HTTP proxy. |
+| Certificate warnings after enabling MITM | `certs/ca.crt` isn't trusted yet — install it (see above). |
+| `MITM_ENABLED=true but no CA` at startup | Set `GEN_CA_ON_START=true`, or run `./scripts/gen-ca.sh` first. |
 
-Check logs:
+Logs:
 
 ```bash
 docker logs -f bequiet-proxy
@@ -176,10 +251,13 @@ docker logs -f bequiet-proxy
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
-# verbose logging
+# plain tunnel
 python proxy.py -v --tunnel-base https://bequiet.pages.dev/fonts/
 
-# quick smoke test through the HTTP proxy
+# with HTTPS interception
+python proxy.py -v --mitm --certs-dir ./certs
+
+# smoke test through the HTTP proxy
 curl -x http://127.0.0.1:8080 https://example.com -I
 ```
 
@@ -187,10 +265,16 @@ Project layout:
 
 ```
 bequiet-docker-proxy/
-├── proxy.py              # HTTP + SOCKS5 proxy server (single file)
-├── requirements.txt      # aiohttp
-├── Dockerfile            # python:3.12-slim, non-root user, healthcheck
-├── docker-compose.yml    # one-command deploy
+├── proxy.py                    # HTTP + SOCKS5 proxy server (single file)
+├── docker-entrypoint.sh        # optional CA gen + start
+├── scripts/gen-ca.sh           # generate root CA + leaf cert
+├── certs/                      # bind-mounted CA/cert volume (git-ignored)
+│   └── .gitkeep
+├── requirements.txt            # aiohttp (+ cryptography for MITM)
+├── Dockerfile                  # python:3.12-slim, non-root, healthcheck
+├── docker-compose.yml          # reads .env, mounts ./certs:/certs
+├── .env.example                # copy to .env
+├── .github/workflows/          # build & publish to GHCR
 ├── .dockerignore
 └── .gitignore
 ```
@@ -201,4 +285,4 @@ MIT — see `LICENSE`.
 
 ## Disclaimer
 
-This project is provided for educational and personal use. It relies on a third-party reverse proxy (`bequiet.pages.dev`) whose availability and behaviour are outside this project's control. Use responsibly.
+Provided for educational and personal use. It relies on a third-party reverse proxy (`bequiet.pages.dev`) whose availability and behaviour are outside this project's control. Use responsibly.

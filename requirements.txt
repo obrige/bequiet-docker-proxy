@@ -1,1 +1,3 @@
 aiohttp>=3.9,<4
+# Only needed for HTTPS interception (MITM_ENABLED=true):
+cryptography>=42

@@ -1,3 +1,8 @@
+# docker-compose.yml — bequiet-docker-proxy
+#
+# Values come from `.env` (copy .env.example to .env and edit it).
+# docker compose reads `.env` automatically from this directory.
+#
 services:
   bequiet-proxy:
     build: .
@@ -5,19 +10,26 @@ services:
     container_name: bequiet-proxy
     restart: unless-stopped
     ports:
-      # host:container
-      - "8080:8080"   # HTTP proxy
-      - "1080:1080"   # SOCKS5 proxy
+      # bind_addr:host_port:container_port
+      - "${BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8080}:8080"   # HTTP proxy
+      - "${BIND_ADDR:-127.0.0.1}:${SOCKS_PORT:-1080}:1080"  # SOCKS5 proxy
     environment:
-      # The Cloudflare Pages reverse proxy prefix. Change if you self-host.
-      TUNNEL_BASE: "https://bequiet.pages.dev/fonts/"
+      # --- Tunnel (the "CF URL") -------------------------------------------
+      TUNNEL_BASE: "${TUNNEL_BASE:-https://bequiet.pages.dev/fonts/}"
+      TUNNEL_TIMEOUT: "${TUNNEL_TIMEOUT:-60}"
+      # --- Listeners (container-internal) ----------------------------------
       HTTP_PORT: "8080"
       SOCKS_PORT: "1080"
-      TUNNEL_TIMEOUT: "60"
-      # Optional SOCKS5 user/pass auth (leave unset for no-auth):
-      # SOCKS_USER: "user"
-      # SOCKS_PASS: "pass"
-    # Only expose to localhost if you don't need LAN access:
-    # ports:
-    #   - "127.0.0.1:8080:8080"
-    #   - "127.0.0.1:1080:1080"
+      # --- HTTPS interception (MITM) ---------------------------------------
+      # true  -> terminate TLS with the local CA and tunnel HTTPS too
+      # false -> HTTPS passes through untunnelled (direct)
+      MITM_ENABLED: "${MITM_ENABLED:-false}"
+      CERTS_DIR: "/certs"
+      # Generate the CA into ./certs on first start (no host openssl needed).
+      GEN_CA_ON_START: "${GEN_CA_ON_START:-false}"
+      # --- Optional SOCKS5 auth --------------------------------------------
+      SOCKS_USER: "${SOCKS_USER:-}"
+      SOCKS_PASS: "${SOCKS_PASS:-}"
+    volumes:
+      # The CA + generated leaf certs persist here, in ./certs on the host.
+      - "${CERTS_DIR:-./certs}:/certs"

@@ -22,6 +22,18 @@ This server fixes that by acting as a *real* forward proxy. Because the browser
 rewrite each request's destination into the CF Pages tunnel URL before it leaves
 the machine. Nothing on the page has to cooperate.
 
+Configuration
+-------------
+Everything is driven by environment variables (see .env.example). Highlights:
+
+  * TUNNEL_HOST / PREFIX        — decouple host from path prefix
+  * PREFIXES                    — several prefixes, rotated by PREFIX_STRATEGY
+  * DIRECT_FALLBACK             — retry directly when the tunnel errors
+                                  (works around Cloudflare-hosted targets)
+  * ALLOW_HOSTS / DENY_HOSTS    — only tunnel / never tunnel matching hosts
+  * EXTRA_HEADERS / USER_AGENT  — customise outbound requests
+  * MITM_ENABLED / CERTS_DIR    — HTTPS interception with a local CA
+
 HTTPS handling (two modes)
 --------------------------
   * MITM_ENABLED=false (default)
@@ -35,18 +47,11 @@ HTTPS handling (two modes)
       and re-encrypts the response back to the client. This tunnels HTTPS too.
       You MUST trust certs/ca.crt for this to work without warnings.
 
-Supported client protocols
---------------------------
-  * HTTP proxy   : absolute-form GET/POST/... and CONNECT (HTTPS)
-  * SOCKS5       : CONNECT command, no auth or user/pass auth
-
-Note: the tunnel blocks websites that are themselves hosted on Cloudflare;
-those will fail with an error page. Add them to your proxy bypass list.
-
 Usage
 -----
-    python3 proxy.py                       # HTTP :8080, SOCKS5 :1080
-    MITM_ENABLED=true CERTS_DIR=./certs python3 proxy.py
+    python3 proxy.py
+    TUNNEL_HOST=https://my.pages.dev PREFIX=/proxy/ python3 proxy.py
+    PREFIXES=/a/,/b/,/c/ PREFIX_STRATEGY=random python3 proxy.py
 """
 
 from __future__ import annotations
@@ -54,16 +59,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ipaddress
+import itertools
 import logging
 import os
+import random
+import re
 import ssl
 import struct
 import sys
 import tempfile
 import threading
 import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -80,22 +89,6 @@ except Exception:  # noqa: BLE001
 
 LOG = logging.getLogger("bequiet-proxy")
 
-# --------------------------------------------------------------------------- #
-# Configuration
-# --------------------------------------------------------------------------- #
-
-DEFAULT_TUNNEL_BASE = os.environ.get("TUNNEL_BASE", "https://bequiet.pages.dev/fonts/")
-DEFAULT_HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-DEFAULT_SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "1080"))
-DEFAULT_TIMEOUT = float(os.environ.get("TUNNEL_TIMEOUT", "60"))
-DEFAULT_CERTS_DIR = os.environ.get("CERTS_DIR", "./certs")
-MITM_ENABLED = os.environ.get("MITM_ENABLED", "false").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-
 # Hop-by-hop headers that must not be forwarded to the origin.
 HOP_BY_HOP = {
     "connection",
@@ -109,21 +102,232 @@ HOP_BY_HOP = {
     "proxy-connection",
 }
 
+
 # --------------------------------------------------------------------------- #
-# Tunnel helpers
+# Helpers for env parsing
 # --------------------------------------------------------------------------- #
 
 
-def build_tunnel_url(tunnel_base: str, target_url: str) -> str:
-    """Turn a target URL into a CF Pages tunnel URL.
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
-    We deliberately do NOT url-encode the embedded URL: the Worker expects the
-    raw scheme/host/path after the prefix. Query strings are preserved verbatim.
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_list(name: str) -> List[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def parse_headers(raw: str) -> Dict[str, str]:
+    """Parse an EXTRA_HEADERS value.
+
+    Accepts either JSON ({"K": "V"}) or a semicolon/newline list ("K: V; K2: V2").
     """
-    base = tunnel_base
-    if not base.endswith("/"):
-        base += "/"
-    return base + target_url
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    headers: Dict[str, str] = {}
+    if raw.startswith("{"):
+        import json
+
+        try:
+            data = json.loads(raw)
+            return {str(k): str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            LOG.warning("EXTRA_HEADERS looks like JSON but failed to parse; ignoring")
+            return {}
+    for chunk in re.split(r"[;\n]", raw):
+        if ":" in chunk:
+            k, _, v = chunk.partition(":")
+            headers[k.strip()] = v.strip()
+    return headers
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Config:
+    # Tunnel endpoint
+    tunnel_host: str = "https://bequiet.pages.dev"
+    prefixes: List[str] = field(default_factory=lambda: ["/fonts/"])
+    prefix_strategy: str = "first"  # first | random | roundrobin
+
+    # Behaviour
+    direct_fallback: bool = False
+    allow_hosts: List[str] = field(default_factory=list)
+    deny_hosts: List[str] = field(default_factory=list)
+
+    # Outbound request tweaks
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    user_agent: Optional[str] = None
+    strip_ua: bool = False
+    verify_ssl: bool = True
+
+    # Networking
+    http_host: str = "0.0.0.0"
+    http_port: int = 8080
+    socks_host: str = "0.0.0.0"
+    socks_port: int = 1080
+    socks_user: Optional[str] = None
+    socks_pass: Optional[str] = None
+    timeout: float = 60.0
+
+    # HTTPS interception
+    mitm: bool = False
+    certs_dir: str = "./certs"
+
+    # Internal
+    _rr_counter: itertools.count = field(default_factory=lambda: itertools.count())
+
+    # -- derived ------------------------------------------------------------ #
+
+    def prefix_for(self, target_url: str) -> str:
+        """Pick a prefix according to the configured strategy."""
+        if len(self.prefixes) == 1:
+            return self.prefixes[0]
+        strategy = self.prefix_strategy.lower()
+        if strategy == "random":
+            return random.choice(self.prefixes)
+        if strategy == "roundrobin":
+            idx = next(self._rr_counter) % len(self.prefixes)
+            return self.prefixes[idx]
+        return self.prefixes[0]
+
+    def build_tunnel_url(self, target_url: str) -> str:
+        host = self.tunnel_host.rstrip("/")
+        prefix = self.prefix_for(target_url)
+        if not prefix.startswith("/"):
+            prefix = "/" + prefix
+        if not prefix.endswith("/"):
+            prefix += "/"
+        return f"{host}{prefix}{target_url}"
+
+    @property
+    def tunnel_netloc(self) -> str:
+        return urllib.parse.urlsplit(self.tunnel_host).netloc
+
+    # -- host filtering ----------------------------------------------------- #
+
+    def host_allowed(self, host: str) -> bool:
+        """Decide whether `host` should be tunnelled.
+
+        * DENY_HOSTS match  -> not tunnelled (direct/blocked)
+        * ALLOW_HOSTS empty -> everything else is tunnelled
+        * ALLOW_HOSTS set   -> only matching hosts are tunnelled
+        """
+        host = (host or "").lower()
+        if any(_host_match(pat, host) for pat in self.deny_hosts):
+            return False
+        if self.allow_hosts:
+            return any(_host_match(pat, host) for pat in self.allow_hosts)
+        return True
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        cfg = cls()
+
+        # --- Tunnel endpoint -------------------------------------------------
+        # Prefer TUNNEL_HOST + PREFIX(ES). Fall back to TUNNEL_BASE for
+        # backwards compatibility (split it into host + prefix).
+        tunnel_host = os.environ.get("TUNNEL_HOST")
+        prefixes = env_list("PREFIXES")
+        prefix = os.environ.get("PREFIX")
+
+        tunnel_base = os.environ.get("TUNNEL_BASE")
+        if tunnel_base and not tunnel_host:
+            # Split ".../fonts/" -> host="https://...", prefix="/fonts/"
+            split = urllib.parse.urlsplit(tunnel_base)
+            tunnel_host = f"{split.scheme}://{split.netloc}"
+            derived_prefix = split.path or "/"
+            if not derived_prefix.endswith("/"):
+                derived_prefix += "/"
+            if not prefixes and not prefix:
+                prefix = derived_prefix
+
+        if tunnel_host:
+            cfg.tunnel_host = tunnel_host.rstrip("/")
+        if prefixes:
+            cfg.prefixes = [_norm_prefix(p) for p in prefixes]
+        elif prefix:
+            cfg.prefixes = [_norm_prefix(prefix)]
+        else:
+            cfg.prefixes = ["/fonts/"]
+
+        cfg.prefix_strategy = os.environ.get("PREFIX_STRATEGY", "first").strip().lower()
+
+        # --- Behaviour -------------------------------------------------------
+        cfg.direct_fallback = env_bool("DIRECT_FALLBACK", False)
+        cfg.allow_hosts = env_list("ALLOW_HOSTS")
+        cfg.deny_hosts = env_list("DENY_HOSTS")
+
+        # --- Outbound tweaks -------------------------------------------------
+        cfg.extra_headers = parse_headers(os.environ.get("EXTRA_HEADERS", ""))
+        cfg.user_agent = os.environ.get("USER_AGENT") or None
+        cfg.strip_ua = env_bool("STRIP_UA", False)
+        cfg.verify_ssl = env_bool("VERIFY_SSL", True)
+
+        # --- Networking ------------------------------------------------------
+        cfg.http_host = os.environ.get("HTTP_HOST", "0.0.0.0")
+        cfg.http_port = env_int("HTTP_PORT", 8080)
+        cfg.socks_host = os.environ.get("SOCKS_HOST", "0.0.0.0")
+        cfg.socks_port = env_int("SOCKS_PORT", 1080)
+        cfg.socks_user = os.environ.get("SOCKS_USER") or None
+        cfg.socks_pass = os.environ.get("SOCKS_PASS") or None
+        cfg.timeout = env_float("TUNNEL_TIMEOUT", 60.0)
+
+        # --- HTTPS interception ---------------------------------------------
+        cfg.mitm = env_bool("MITM_ENABLED", False)
+        cfg.certs_dir = os.environ.get("CERTS_DIR", "./certs")
+
+        return cfg
+
+
+def _norm_prefix(p: str) -> str:
+    p = p.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    if not p.endswith("/"):
+        p += "/"
+    return p
+
+
+def _host_match(pattern: str, host: str) -> bool:
+    """Glob/regex-ish host matching.
+
+    Supports '*', '*.example.com', 'example.com', and '/regex/' forms.
+    """
+    pattern = pattern.strip().lower()
+    if pattern.startswith("/") and pattern.endswith("/") and len(pattern) > 2:
+        try:
+            return re.search(pattern[1:-1], host) is not None
+        except re.error:
+            return False
+    if pattern.startswith("*."):
+        return host == pattern[2:] or host.endswith(pattern[1:])
+    if pattern.startswith("*"):
+        return host.endswith(pattern[1:])
+    if pattern.endswith("*"):
+        return host.startswith(pattern[:-1])
+    return host == pattern
 
 
 def normalize_target(scheme: str, host: str, port: int, path: str) -> str:
@@ -143,11 +347,7 @@ def normalize_target(scheme: str, host: str, port: int, path: str) -> str:
 
 
 class CertAuthority:
-    """Loads a root CA and mints/caches per-host leaf certificates.
-
-    Uses the `cryptography` package if available. Leaf certs are kept in a small
-    in-memory cache keyed by hostname.
-    """
+    """Loads a root CA and mints/caches per-host leaf certificates."""
 
     def __init__(self, certs_dir: str):
         self.certs_dir = certs_dir
@@ -173,18 +373,19 @@ class CertAuthority:
             self._ca_key = serialization.load_pem_private_key(fh.read(), password=None)
         with open(crt_path, "rb") as fh:
             self._ca_cert = x509.load_pem_x509_certificate(fh.read())
-        LOG.info("Loaded CA from %s (subject=%s)", self.certs_dir, self._ca_cert.subject.rfc4514_string())
+        LOG.info(
+            "Loaded CA from %s (subject=%s)",
+            self.certs_dir,
+            self._ca_cert.subject.rfc4514_string(),
+        )
 
     def context_for(self, host: str) -> ssl.SSLContext:
-        """Return an SSLContext presenting a leaf cert valid for `host`."""
         now = datetime.now(timezone.utc).timestamp()
         with self._lock:
             cached = self._cache.get(host)
             if cached and cached[1] > now:
                 return cached[0]
-
             ctx = self._mint(host)
-            # Cache for ~1 hour.
             self._cache[host] = (ctx, now + 3600)
             return ctx
 
@@ -219,7 +420,6 @@ class CertAuthority:
             .sign(self._ca_key, hashes.SHA256())
         )
 
-        # Write to a temp dir and load into an SSLContext.
         tmpdir = tempfile.mkdtemp(prefix="bq-mitm-")
         cert_path = os.path.join(tmpdir, "cert.pem")
         key_path = os.path.join(tmpdir, "key.pem")
@@ -240,6 +440,29 @@ class CertAuthority:
 
 
 # --------------------------------------------------------------------------- #
+# Outbound header builder
+# --------------------------------------------------------------------------- #
+
+
+def build_forward_headers(cfg: Config, incoming) -> Dict[str, str]:
+    headers = {
+        k: v
+        for k, v in incoming.items()
+        if k.lower() not in HOP_BY_HOP and k.lower() != "host"
+    }
+    # Present the tunnel host to Cloudflare, not the origin.
+    headers["Host"] = cfg.tunnel_netloc
+    if cfg.strip_ua:
+        headers.pop("User-Agent", None)
+    elif cfg.user_agent:
+        headers["User-Agent"] = cfg.user_agent
+    # Custom headers (may override anything above).
+    for k, v in cfg.extra_headers.items():
+        headers[k] = v
+    return headers
+
+
+# --------------------------------------------------------------------------- #
 # HTTP proxy (absolute-form + CONNECT, with optional MITM)
 # --------------------------------------------------------------------------- #
 
@@ -247,28 +470,30 @@ class CertAuthority:
 class HttpProxy:
     """An aiohttp-based HTTP forward proxy that reroutes via the tunnel."""
 
-    def __init__(
-        self,
-        tunnel_base: str,
-        timeout: float = DEFAULT_TIMEOUT,
-        ca: Optional[CertAuthority] = None,
-    ):
-        self.tunnel_base = tunnel_base
-        self.timeout = timeout
+    def __init__(self, cfg: Config, ca: Optional[CertAuthority] = None):
+        self.cfg = cfg
         self.ca = ca
         self._session: Optional[aiohttp.ClientSession] = None
+        self._direct_session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
         self._session = aiohttp.ClientSession(
             connector=connector,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),
             auto_decompress=True,
         )
+        if self.cfg.direct_fallback:
+            self._direct_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0),
+                timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),
+                auto_decompress=True,
+            )
 
     async def stop(self) -> None:
-        if self._session:
-            await self._session.close()
+        for s in (self._session, self._direct_session):
+            if s:
+                await s.close()
 
     # -- entrypoint --------------------------------------------------------- #
 
@@ -276,8 +501,6 @@ class HttpProxy:
         if request.method == "CONNECT":
             return await self._handle_connect(request)
         return await self._forward(request)
-
-    # -- plain HTTP --------------------------------------------------------- #
 
     async def _forward(self, request: web.Request) -> web.StreamResponse:
         target_url = self._resolve_target(request)
@@ -310,18 +533,16 @@ class HttpProxy:
     async def _handle_connect_splice(
         self, request: web.Request, host: str, port: int
     ) -> web.StreamResponse:
-        """Direct TCP splice — HTTPS works but is NOT tunnelled."""
         LOG.info("CONNECT %s:%s (direct splice, not tunnelled)", host, port)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=self.timeout
+                asyncio.open_connection(host, port), timeout=self.cfg.timeout
             )
         except OSError as exc:
             return web.Response(status=502, text=f"CONNECT failed: {exc}")
 
         resp = web.StreamResponse(status=200, reason="Connection Established")
         await resp.prepare(request)
-        client_reader = request.transport
 
         async def pipe(reader, writer):
             try:
@@ -334,7 +555,6 @@ class HttpProxy:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Splice both directions.
         t1 = asyncio.create_task(self._splice_client(request, upstream_writer))
         t2 = asyncio.create_task(pipe(upstream_reader, request.transport))
         await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
@@ -360,7 +580,6 @@ class HttpProxy:
     async def _handle_connect_mitm(
         self, request: web.Request, host: str, port: int
     ) -> web.StreamResponse:
-        """Terminate TLS, read the HTTP request, tunnel it, re-encrypt back."""
         LOG.info("CONNECT %s:%s (MITM, tunnelled)", host, port)
         resp = web.StreamResponse(status=200, reason="Connection Established")
         await resp.prepare(request)
@@ -368,14 +587,11 @@ class HttpProxy:
         transport = request.transport
         try:
             server_ctx = self.ca.context_for(host)
-            tls_transport = await transport.start_tls(
-                server_ctx, server_hostname=None
-            )
+            tls_transport = await transport.start_tls(server_ctx, server_hostname=None)
         except Exception as exc:  # noqa: BLE001
             LOG.warning("MITM TLS handshake failed for %s: %s", host, exc)
             return resp
 
-        # Read requests off the TLS transport in a loop (keep-alive aware).
         await self._mitm_loop(tls_transport, host, port)
         return resp
 
@@ -383,7 +599,9 @@ class HttpProxy:
         scheme = "https"
         while True:
             try:
-                head = await asyncio.wait_for(self._read_until(tls_transport, b"\r\n\r\n"), self.timeout)
+                head = await asyncio.wait_for(
+                    self._read_until(tls_transport, b"\r\n\r\n"), self.cfg.timeout
+                )
             except Exception:  # noqa: BLE001
                 return
             if not head:
@@ -396,7 +614,6 @@ class HttpProxy:
             path = parts[1].decode()
 
             headers = self._parse_headers(header_block)
-            # Read body if Content-Length is present.
             body = b""
             clen = headers.get("Content-Length")
             if clen:
@@ -416,7 +633,9 @@ class HttpProxy:
                 return
 
             status, reason, resp_headers, resp_body = upstream
-            await self._write_response(tls_transport, status, reason, resp_headers, resp_body)
+            await self._write_response(
+                tls_transport, status, reason, resp_headers, resp_body
+            )
 
             if headers.get("Connection", "").lower() == "close":
                 return
@@ -426,39 +645,77 @@ class HttpProxy:
     async def _fetch_and_relay(
         self, method, target_url, headers, body, request
     ) -> web.StreamResponse:
-        tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
-        LOG.info("%s %s -> %s", method, target_url, tunnel_url)
+        host = urllib.parse.urlsplit(target_url).hostname or ""
+        fwd_headers = build_forward_headers(self.cfg, headers)
 
-        fwd_headers = {
-            k: v
-            for k, v in headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
-        }
-        fwd_headers["Host"] = urllib.parse.urlsplit(self.tunnel_base).netloc
+        if not self.cfg.host_allowed(host):
+            if self.cfg.direct_fallback:
+                LOG.info("%s %s -> DIRECT (host not tunnelled)", method, target_url)
+                return await self._relay_direct(request, method, target_url, fwd_headers, body)
+            return web.Response(status=403, text=f"Host not allowed: {host}")
+
+        tunnel_url = self.cfg.build_tunnel_url(target_url)
+        LOG.info("%s %s -> %s", method, target_url, tunnel_url)
 
         try:
             async with self._session.request(
                 method,
                 tunnel_url,
                 headers=fwd_headers,
+                data=body if body else None,
+                allow_redirects=False,
+                ssl=self.cfg.verify_ssl,
+            ) as upstream:
+                if self._is_tunnel_error(upstream) and self.cfg.direct_fallback:
+                    LOG.info("%s %s -> tunnel error, retrying DIRECT", method, target_url)
+                    return await self._relay_direct(
+                        request, method, target_url, fwd_headers, body
+                    )
+                return await self._relay(request, upstream)
+        except aiohttp.ClientError as exc:
+            LOG.warning("upstream error for %s: %s", target_url, exc)
+            if self.cfg.direct_fallback:
+                LOG.info("%s %s -> upstream error, retrying DIRECT", method, target_url)
+                return await self._relay_direct(request, method, target_url, fwd_headers, body)
+            return web.Response(status=502, text=f"Tunnel error: {exc}")
+
+    async def _relay_direct(self, request, method, target_url, headers, body):
+        if self._direct_session is None:
+            return web.Response(status=502, text="Direct fallback unavailable")
+        direct_headers = {k: v for k, v in headers.items() if k.lower() != "host"}
+        try:
+            async with self._direct_session.request(
+                method,
+                target_url,
+                headers=direct_headers,
                 data=body if body else None,
                 allow_redirects=False,
             ) as upstream:
                 return await self._relay(request, upstream)
         except aiohttp.ClientError as exc:
-            LOG.warning("upstream error for %s: %s", target_url, exc)
-            return web.Response(status=502, text=f"Tunnel error: {exc}")
+            return web.Response(status=502, text=f"Direct error: {exc}")
+
+    @staticmethod
+    def _is_tunnel_error(upstream: aiohttp.ClientResponse) -> bool:
+        """Heuristically detect a Cloudflare Worker error response."""
+        if upstream.status >= 500:
+            return True
+        ct = upstream.headers.get("Content-Type", "")
+        server = upstream.headers.get("Server", "").lower()
+        return "text/html" in ct and "cloudflare" in server and upstream.status == 200
 
     async def _fetch(self, method, target_url, headers, body):
         """Non-streaming fetch used by the MITM loop."""
-        tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
+        host = urllib.parse.urlsplit(target_url).hostname or ""
+        fwd_headers = build_forward_headers(self.cfg, headers)
+
+        if not self.cfg.host_allowed(host):
+            if not self.cfg.direct_fallback:
+                return 403, "Forbidden", [("Content-Type", "text/plain")], b"Host not allowed"
+            return await self._fetch_direct(method, target_url, fwd_headers, body)
+
+        tunnel_url = self.cfg.build_tunnel_url(target_url)
         LOG.info("MITM %s %s -> %s", method, target_url, tunnel_url)
-        fwd_headers = {
-            k: v
-            for k, v in headers.items()
-            if k.lower() not in HOP_BY_HOP and k.lower() != "host"
-        }
-        fwd_headers["Host"] = urllib.parse.urlsplit(self.tunnel_base).netloc
         try:
             async with self._session.request(
                 method,
@@ -466,17 +723,44 @@ class HttpProxy:
                 headers=fwd_headers,
                 data=body if body else None,
                 allow_redirects=False,
+                ssl=self.cfg.verify_ssl,
             ) as upstream:
-                resp_body = await upstream.read()
-                resp_headers = [
-                    (k, v)
-                    for k, v in upstream.headers.items()
-                    if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
-                ]
-                return upstream.status, upstream.reason, resp_headers, resp_body
+                if self._is_tunnel_error(upstream) and self.cfg.direct_fallback:
+                    LOG.info("MITM %s %s -> tunnel error, retrying DIRECT", method, target_url)
+                    return await self._fetch_direct(method, target_url, fwd_headers, body)
+                return await self._read_response(upstream)
         except aiohttp.ClientError as exc:
             LOG.warning("MITM upstream error for %s: %s", target_url, exc)
+            if self.cfg.direct_fallback:
+                return await self._fetch_direct(method, target_url, fwd_headers, body)
             return None
+
+    async def _fetch_direct(self, method, target_url, headers, body):
+        if self._direct_session is None:
+            return None
+        direct_headers = {k: v for k, v in headers.items() if k.lower() != "host"}
+        try:
+            async with self._direct_session.request(
+                method,
+                target_url,
+                headers=direct_headers,
+                data=body if body else None,
+                allow_redirects=False,
+            ) as upstream:
+                return await self._read_response(upstream)
+        except aiohttp.ClientError as exc:
+            LOG.warning("direct fetch error for %s: %s", target_url, exc)
+            return None
+
+    @staticmethod
+    async def _read_response(upstream):
+        resp_body = await upstream.read()
+        resp_headers = [
+            (k, v)
+            for k, v in upstream.headers.items()
+            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length"
+        ]
+        return upstream.status, upstream.reason, resp_headers, resp_body
 
     async def _relay(self, request, upstream) -> web.StreamResponse:
         resp_headers = {
@@ -563,26 +847,15 @@ SOCKS_ATYP_IPV6 = 0x04
 class Socks5Proxy:
     """A minimal SOCKS5 server (CONNECT only) that reroutes via the tunnel."""
 
-    def __init__(
-        self,
-        tunnel_base: str,
-        timeout: float = DEFAULT_TIMEOUT,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        ca: Optional[CertAuthority] = None,
-    ):
-        self.tunnel_base = tunnel_base
-        self.timeout = timeout
-        self.username = username
-        self.password = password
+    def __init__(self, cfg: Config, ca: Optional[CertAuthority] = None):
+        self.cfg = cfg
         self.ca = ca
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
-        connector = aiohttp.TCPConnector(limit=0)
         self._session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=aiohttp.TCPConnector(limit=0),
+            timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),
             auto_decompress=True,
         )
 
@@ -590,7 +863,7 @@ class Socks5Proxy:
         if self._session:
             await self._session.close()
 
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def handle(self, reader, writer) -> None:
         try:
             await self._negotiate(reader, writer)
             target = await self._read_request(reader, writer)
@@ -616,7 +889,7 @@ class Socks5Proxy:
             raise ValueError("unsupported SOCKS version")
         methods = await reader.readexactly(nmethods)
 
-        if self.username is not None:
+        if self.cfg.socks_user is not None:
             if SOCKS_AUTH_USERPASS not in methods:
                 writer.write(bytes([SOCKS_VERSION, SOCKS_AUTH_NO_ACCEPTABLE]))
                 await writer.drain()
@@ -640,7 +913,7 @@ class Socks5Proxy:
         username = (await reader.readexactly(ulen)).decode()
         plen = (await reader.readexactly(1))[0]
         password = (await reader.readexactly(plen)).decode()
-        ok = username == self.username and password == self.password
+        ok = username == self.cfg.socks_user and password == self.cfg.socks_pass
         writer.write(bytes([0x01, 0x00 if ok else 0x01]))
         await writer.drain()
         if not ok:
@@ -675,18 +948,14 @@ class Socks5Proxy:
 
     async def _tunnel(self, reader, writer, scheme, host, port) -> None:
         target_url = normalize_target(scheme, host, port, "/")
-        tunnel_url = build_tunnel_url(self.tunnel_base, target_url)
-        LOG.info("SOCKS5 CONNECT %s:%s -> %s", host, port, tunnel_url)
+        LOG.info("SOCKS5 CONNECT %s:%s", host, port)
 
         await self._reply(writer, 0x00)
-        first = await asyncio.wait_for(reader.read(1), timeout=self.timeout)
+        first = await asyncio.wait_for(reader.read(1), timeout=self.cfg.timeout)
         if not first:
             return
 
         if first == b"\x16":
-            # TLS ClientHello. Without MITM we can't transparently tunnel raw
-            # TLS through an HTTP reverse proxy; with MITM we could terminate
-            # it, but SOCKS5 has no SNI-capture step here. Advise HTTP proxy.
             LOG.info(
                 "SOCKS5 TLS to %s cannot be tunnelled through an HTTP reverse "
                 "proxy; use the HTTP proxy (CONNECT + MITM) instead.",
@@ -702,12 +971,17 @@ class Socks5Proxy:
             absolute = path.decode()
         else:
             absolute = normalize_target(scheme, host, port, path.decode())
-        tunnel = build_tunnel_url(self.tunnel_base, absolute)
+
+        incoming_headers = self._parse_headers(header_block)
+        fwd_headers = build_forward_headers(self.cfg, incoming_headers)
+        tunnel = self.cfg.build_tunnel_url(absolute)
 
         async with self._session.request(
-            method.decode(), tunnel, headers=self._parse_headers(header_block), data=None
+            method.decode(), tunnel, headers=fwd_headers, data=None
         ) as upstream:
-            writer.write(b"HTTP/1.1 %d %s\r\n" % (upstream.status, upstream.reason.encode()))
+            writer.write(
+                b"HTTP/1.1 %d %s\r\n" % (upstream.status, upstream.reason.encode())
+            )
             for k, v in upstream.headers.items():
                 if k.lower() not in HOP_BY_HOP:
                     writer.write(f"{k}: {v}\r\n".encode())
@@ -732,20 +1006,14 @@ class Socks5Proxy:
 # --------------------------------------------------------------------------- #
 
 
-async def run(args: argparse.Namespace) -> None:
+async def run(cfg: Config) -> None:
     ca = None
-    if args.mitm:
-        ca = CertAuthority(args.certs_dir)
+    if cfg.mitm:
+        ca = CertAuthority(cfg.certs_dir)
         ca.load()
 
-    http_proxy = HttpProxy(args.tunnel_base, timeout=args.timeout, ca=ca)
-    socks_proxy = Socks5Proxy(
-        args.tunnel_base,
-        timeout=args.timeout,
-        username=args.socks_user,
-        password=args.socks_pass,
-        ca=ca,
-    )
+    http_proxy = HttpProxy(cfg, ca=ca)
+    socks_proxy = Socks5Proxy(cfg, ca=ca)
     await http_proxy.start()
     await socks_proxy.start()
 
@@ -753,16 +1021,22 @@ async def run(args: argparse.Namespace) -> None:
     app.router.add_route("*", "/{tail:.*}", http_proxy.handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    http_site = web.TCPSite(runner, args.http_host, args.http_port)
+    http_site = web.TCPSite(runner, cfg.http_host, cfg.http_port)
     await http_site.start()
 
     socks_server = await asyncio.start_server(
-        socks_proxy.handle, args.socks_host, args.socks_port
+        socks_proxy.handle, cfg.socks_host, cfg.socks_port
     )
 
-    LOG.info("HTTP proxy listening on %s:%s", args.http_host, args.http_port)
-    LOG.info("SOCKS5 proxy listening on %s:%s", args.socks_host, args.socks_port)
-    LOG.info("Tunnel base: %s", args.tunnel_base)
+    LOG.info("HTTP proxy listening on %s:%s", cfg.http_host, cfg.http_port)
+    LOG.info("SOCKS5 proxy listening on %s:%s", cfg.socks_host, cfg.socks_port)
+    LOG.info("Tunnel host: %s", cfg.tunnel_host)
+    LOG.info("Prefixes: %s (strategy=%s)", cfg.prefixes, cfg.prefix_strategy)
+    LOG.info("Direct fallback: %s", cfg.direct_fallback)
+    if cfg.allow_hosts:
+        LOG.info("Allow hosts: %s", cfg.allow_hosts)
+    if cfg.deny_hosts:
+        LOG.info("Deny hosts: %s", cfg.deny_hosts)
     LOG.info("MITM: %s", "enabled" if ca else "disabled")
 
     try:
@@ -775,34 +1049,71 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="bequiet CF Pages forward proxy")
-    parser.add_argument("--tunnel-base", default=DEFAULT_TUNNEL_BASE)
-    parser.add_argument("--http-host", default="0.0.0.0")
-    parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT)
-    parser.add_argument("--socks-host", default="0.0.0.0")
-    parser.add_argument("--socks-port", type=int, default=DEFAULT_SOCKS_PORT)
-    parser.add_argument("--socks-user", default=os.environ.get("SOCKS_USER"))
-    parser.add_argument("--socks-pass", default=os.environ.get("SOCKS_PASS"))
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--certs-dir", default=DEFAULT_CERTS_DIR)
-    parser.add_argument(
-        "--mitm",
-        action="store_true",
-        default=MITM_ENABLED,
-        help="Enable HTTPS interception using the CA in --certs-dir",
+    parser = argparse.ArgumentParser(
+        description="bequiet CF Pages forward proxy (env-driven; flags override env)"
     )
+    parser.add_argument("--tunnel-host", help="Tunnel origin, e.g. https://bequiet.pages.dev")
+    parser.add_argument("--prefix", help="Single tunnel path prefix, e.g. /fonts/")
+    parser.add_argument("--prefixes", help="Comma-separated prefixes for rotation")
+    parser.add_argument("--prefix-strategy", choices=["first", "random", "roundrobin"])
+    parser.add_argument("--direct-fallback", action="store_true", default=None)
+    parser.add_argument("--http-host")
+    parser.add_argument("--http-port", type=int)
+    parser.add_argument("--socks-host")
+    parser.add_argument("--socks-port", type=int)
+    parser.add_argument("--socks-user")
+    parser.add_argument("--socks-pass")
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument("--certs-dir")
+    parser.add_argument("--mitm", action="store_true", default=None)
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)
 
 
+def build_config(args: argparse.Namespace) -> Config:
+    cfg = Config.from_env()
+    # CLI flags override env where provided.
+    if args.tunnel_host:
+        cfg.tunnel_host = args.tunnel_host.rstrip("/")
+    if args.prefixes:
+        cfg.prefixes = [_norm_prefix(p) for p in args.prefixes.split(",") if p.strip()]
+    elif args.prefix:
+        cfg.prefixes = [_norm_prefix(args.prefix)]
+    if args.prefix_strategy:
+        cfg.prefix_strategy = args.prefix_strategy
+    if args.direct_fallback:
+        cfg.direct_fallback = True
+    if args.http_host:
+        cfg.http_host = args.http_host
+    if args.http_port:
+        cfg.http_port = args.http_port
+    if args.socks_host:
+        cfg.socks_host = args.socks_host
+    if args.socks_port:
+        cfg.socks_port = args.socks_port
+    if args.socks_user:
+        cfg.socks_user = args.socks_user
+    if args.socks_pass:
+        cfg.socks_pass = args.socks_pass
+    if args.timeout:
+        cfg.timeout = args.timeout
+    if args.certs_dir:
+        cfg.certs_dir = args.certs_dir
+    if args.mitm:
+        cfg.mitm = True
+    return cfg
+
+
 def main() -> None:
     args = parse_args()
+    level = logging.DEBUG if (args.verbose or env_bool("VERBOSE")) else os.environ.get("LOG_LEVEL", "INFO")
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    cfg = build_config(args)
     try:
-        asyncio.run(run(args))
+        asyncio.run(run(cfg))
     except KeyboardInterrupt:
         LOG.info("shutting down")
         sys.exit(0)

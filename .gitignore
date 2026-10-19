@@ -9,3 +9,10 @@ env/
 *.log
 .DS_Store
 docker-compose.override.yml
+
+# Local configuration (may contain secrets)
+.env
+
+# Generated certificates & CA private keys — NEVER commit these
+certs/*
+!certs/.gitkeep

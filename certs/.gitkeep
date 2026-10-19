@@ -1,0 +1,4 @@
+# This folder is bind-mounted into the container at /certs.
+# Run `./scripts/gen-ca.sh` (or set GEN_CA_ON_START=true) to generate:
+#   ca.key  ca.crt  leaf.key  leaf.crt
+# These files are git-ignored — never commit private keys.

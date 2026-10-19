@@ -4,7 +4,7 @@ Turn [`bequiet.pages.dev`](https://bequiet.pages.dev) — a Cloudflare Pages **p
 
 Point your browser's proxy at this container and *all* traffic is tunnelled through the Cloudflare Pages edge. No more "some sites load, some don't" — every request (navigations, XHR/fetch, images, CSS, JS) is rewritten and routed through the tunnel.
 
-Everything is configurable via `.env`: the **tunnel host**, the **path prefix** (single or several, rotated), host allow/deny lists, a **direct fallback** for Cloudflare-hosted targets, custom headers, and optional **HTTPS interception (MITM)** with a local CA generated into a mounted `./certs` volume.
+Everything is configurable via `.env`: the **tunnel host**, the **path prefix** (single or several, rotated), host allow/deny lists, a **direct fallback** for Cloudflare error pages, custom headers, and optional **HTTPS interception (MITM)** with a local CA generated into a mounted `./certs` volume.
 
 ---
 
@@ -14,6 +14,7 @@ Everything is configurable via `.env`: the **tunnel host**, the **path prefix** 
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Configuration reference](#configuration-reference)
+- [How tunnel errors are detected](#how-tunnel-errors-are-detected)
 - [Customisation cookbook](#customisation-cookbook)
 - [HTTPS interception & the local CA](#https-interception--the-local-ca)
 - [Client setup (Zero Omega)](#client-setup-zero-omega)
@@ -40,9 +41,9 @@ The **host** and **prefix** are both configurable, so you can point it at your o
 
 It has one catch worth knowing up front:
 
-> **The tunnel blocks websites that are themselves hosted on Cloudflare.** Requests to Cloudflare-fronted origins (e.g. `cloudflare.com`, other `*.pages.dev` / `*.workers.dev` sites) return a Worker error instead of the page. Everything else — sites on their own infra, or on non-Cloudflare CDNs — passes through.
+> **The tunnel sometimes returns a Cloudflare error page instead of the target.** This happens for websites that are themselves hosted on Cloudflare (e.g. `cloudflare.com`, other `*.pages.dev` / `*.workers.dev` sites), and occasionally for other targets when the Worker is under load. The page is a standard Cloudflare "Worker threw exception" error.
 
-This project gives you two ways to cope: add those hosts to `DENY_HOSTS`, and/or enable `DIRECT_FALLBACK` so that when the tunnel errors, the request is retried directly.
+This project gives you two ways to cope: add those hosts to `DENY_HOSTS`, and/or enable `DIRECT_FALLBACK` so that when the tunnel returns such an error page, the request is retried directly.
 
 ### The problem with using the raw URL in a browser
 
@@ -111,7 +112,7 @@ All settings live in `.env` (copied from `.env.example`). `docker compose` reads
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `DIRECT_FALLBACK` | `false` | On tunnel error (e.g. Cloudflare-hosted target), retry the request **directly**. |
+| `DIRECT_FALLBACK` | `false` | On a Cloudflare error page, retry the request **directly**. See [detection](#how-tunnel-errors-are-detected). |
 | `ALLOW_HOSTS` | *(empty)* | Only tunnel matching hosts. Empty = tunnel everything. |
 | `DENY_HOSTS` | *(empty)* | Never tunnel matching hosts (direct if `DIRECT_FALLBACK`, else 403). |
 
@@ -145,6 +146,21 @@ Host patterns support `example.com`, `*.example.com`, `prefix*`, and `/regex/`.
 | `CERTS_DIR` | `./certs` | Host folder holding the CA (bind-mounted to `/certs`). |
 | `GEN_CA_ON_START` | `false` | Generate the CA into `CERTS_DIR` on first container start. |
 | `LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`. |
+
+## How tunnel errors are detected
+
+With `DIRECT_FALLBACK=true`, the proxy must tell a **real origin 5xx** apart from a **Cloudflare error page** produced by the tunnel. This is done by an exact signature, measured against the live tunnel:
+
+| Signal | Cloudflare error page | Successful tunnelled response |
+| --- | --- | --- |
+| HTTP status | **5xx** (typically `500`) | `200` |
+| `content-type` | `text/html; charset=UTF-8` | varies |
+| body markers | **`Worker threw exception`**, `cf.errors.css`, or `cloudflare.com/5xx-error-landing` | none |
+| `server` / `cf-ray` | present | **also present** → *not* discriminators |
+
+So the rule is: **status 5xx AND `text/html` AND body contains a Cloudflare error-page marker.** Only the first 8 KB of the body is peeked for the markers; if the response turns out to be a legitimate 5xx, the peeked bytes plus the remaining stream are relayed to the client unchanged — nothing is lost.
+
+`server: cloudflare` and `cf-ray` appear on *successful* responses too, so they are deliberately ignored. A genuine 5xx from a real origin will not contain the Cloudflare error markers, so it is passed through as-is.
 
 ## Customisation cookbook
 
@@ -264,7 +280,7 @@ ghcr.io/obrige/bequiet-docker-proxy:latest
 
 ## Limitations
 
-- **Cloudflare-hosted origins are blocked by the tunnel itself.** Use `DENY_HOSTS` + `DIRECT_FALLBACK`, or self-host a Worker without that restriction.
+- **Cloudflare-hosted origins may be blocked by the tunnel.** Use `DENY_HOSTS` + `DIRECT_FALLBACK`, or self-host a Worker without that restriction.
 - **HTTPS over SOCKS5 is not transparently tunnellable.** Use the **HTTP proxy** for HTTPS.
 - **MITM is not transparent to certificate pinning.** Sites/apps that pin certs will still fail.
 - **Latency / throughput** are bounded by the Cloudflare Pages edge and the Worker.
@@ -277,7 +293,7 @@ ghcr.io/obrige/bequiet-docker-proxy:latest
 | Symptom | Likely cause / fix |
 | --- | --- |
 | Pages "half load" (HTML ok, assets missing) | Browser isn't routing **all** traffic through the proxy. Enable "apply to all" in Zero Omega. |
-| `Worker threw exception` / error page | Target site is hosted on Cloudflare — set `DIRECT_FALLBACK=true` and/or add it to `DENY_HOSTS`. |
+| `Worker threw exception` / error page | Set `DIRECT_FALLBACK=true` and/or add the host to `DENY_HOSTS`. |
 | `Tunnel error: ...` from the proxy | Outbound request failed/timed out. Raise `TUNNEL_TIMEOUT`, or the target is blocked. |
 | Everything returns 403 | `ALLOW_HOSTS` is set and the target doesn't match. |
 | HTTPS fails on SOCKS5 | Expected — use the HTTP proxy. |

@@ -1,0 +1,23 @@
+services:
+  bequiet-proxy:
+    build: .
+    image: bequiet-docker-proxy:latest
+    container_name: bequiet-proxy
+    restart: unless-stopped
+    ports:
+      # host:container
+      - "8080:8080"   # HTTP proxy
+      - "1080:1080"   # SOCKS5 proxy
+    environment:
+      # The Cloudflare Pages reverse proxy prefix. Change if you self-host.
+      TUNNEL_BASE: "https://bequiet.pages.dev/fonts/"
+      HTTP_PORT: "8080"
+      SOCKS_PORT: "1080"
+      TUNNEL_TIMEOUT: "60"
+      # Optional SOCKS5 user/pass auth (leave unset for no-auth):
+      # SOCKS_USER: "user"
+      # SOCKS_PASS: "pass"
+    # Only expose to localhost if you don't need LAN access:
+    # ports:
+    #   - "127.0.0.1:8080:8080"
+    #   - "127.0.0.1:1080:1080"
